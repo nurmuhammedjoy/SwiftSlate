@@ -81,7 +81,7 @@ jobs:
             TAG="$GIT_REF_NAME"
             CREATE_TAG=false
           else
-            PATCH=$(git tag -l "v${BASE_VERSION}.*" | grep -v beta | sed "s/v${BASE_VERSION}\.//" | sort -n | tail -1)
+            PATCH=$(git tag -l "v${BASE_VERSION}.*" | grep -v beta | sed "s/v${BASE_VERSION}\.//" | sort -n | tail -1 || true)
             NEXT=$((${PATCH:--1} + 1))
             TAG="v${BASE_VERSION}.${NEXT}"
             CREATE_TAG=true
@@ -104,7 +104,7 @@ jobs:
               if [[ "$HTTP_CODE" == "404" ]] && git merge-base --is-ancestor "$PATCH_TAG" HEAD; then
                 echo "::notice::Tag $PATCH_TAG has no release and is part of this branch — removing the orphan and reusing the version."
                 git push origin --delete "refs/tags/$PATCH_TAG"
-                PATCH=$(git tag -l "v${BASE_VERSION}.*" | grep -v beta | sed "s/v${BASE_VERSION}\.//" | sort -n | tail -1)
+                PATCH=$(git tag -l "v${BASE_VERSION}.*" | grep -v beta | sed "s/v${BASE_VERSION}\.//" | sort -n | tail -1 || true)
                 NEXT=$((${PATCH:--1} + 1))
                 TAG="v${BASE_VERSION}.${NEXT}"
               fi
