@@ -24,6 +24,7 @@ import androidx.compose.ui.unit.sp
 import com.musheer360.swiftslate.BuildConfig
 import com.musheer360.swiftslate.R
 import com.musheer360.swiftslate.api.ApiClientUtils
+import com.musheer360.swiftslate.api.GeminiClient
 import com.musheer360.swiftslate.api.OpenAICompatibleClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -32,11 +33,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.musheer360.swiftslate.manager.CommandManager
 import com.musheer360.swiftslate.manager.KeyManager
+import com.musheer360.swiftslate.manager.ProviderModelsCache
 import com.musheer360.swiftslate.model.GeminiModels
 import com.musheer360.swiftslate.model.GroqModels
 import com.musheer360.swiftslate.model.PrefKeys
 import com.musheer360.swiftslate.model.ProviderType
 import com.musheer360.swiftslate.provider.EndpointValidator
+import com.musheer360.swiftslate.provider.GroqConfig
+import com.musheer360.swiftslate.ui.components.LocalSlateRhythm
 import com.musheer360.swiftslate.ui.components.ScreenTitle
 import com.musheer360.swiftslate.ui.components.SlateCard
 import com.musheer360.swiftslate.ui.components.SlateDivider
@@ -56,13 +60,13 @@ fun SettingsScreen(commandManager: CommandManager, prefs: SharedPreferences, key
     var providerType by remember { mutableStateOf(prefs.getString(PrefKeys.PROVIDER_TYPE, ProviderType.GEMINI) ?: ProviderType.GEMINI) }
     var providerExpanded by remember { mutableStateOf(false) }
 
-    var selectedModel by remember { mutableStateOf(GeminiModels.sanitize(prefs.getString(PrefKeys.GEMINI_MODEL, GeminiModels.DEFAULT))) }
+    var selectedModel by remember { mutableStateOf(prefs.getString(PrefKeys.GEMINI_MODEL, "") ?: "") }
     var modelExpanded by remember { mutableStateOf(false) }
-    val geminiModels = GeminiModels.OPTIONS
+    var geminiModelList by remember { mutableStateOf(ProviderModelsCache.get(ProviderType.GEMINI)?.models ?: emptyList()) }
 
-    var groqModel by remember { mutableStateOf(GroqModels.sanitize(prefs.getString(PrefKeys.GROQ_MODEL, GroqModels.DEFAULT))) }
+    var groqModel by remember { mutableStateOf(prefs.getString(PrefKeys.GROQ_MODEL, "") ?: "") }
     var groqModelExpanded by remember { mutableStateOf(false) }
-    val groqModels = GroqModels.OPTIONS
+    var groqModelList by remember { mutableStateOf(ProviderModelsCache.get(ProviderType.GROQ)?.models ?: emptyList()) }
 
     var customEndpoint by rememberSaveable { mutableStateOf(prefs.getString(PrefKeys.CUSTOM_ENDPOINT, "") ?: "") }
     var customModel by rememberSaveable { mutableStateOf(prefs.getString(PrefKeys.CUSTOM_MODEL, "") ?: "") }
@@ -74,8 +78,11 @@ fun SettingsScreen(commandManager: CommandManager, prefs: SharedPreferences, key
     var isFetchingModels by remember { mutableStateOf(false) }
     var fetchMessage by remember { mutableStateOf<String?>(null) }
     var fetchSuccess by remember { mutableStateOf(false) }
+    var isFetchingGeminiModels by remember { mutableStateOf(false) }
+    var isFetchingGroqModels by remember { mutableStateOf(false) }
     var apiKeys by remember { mutableStateOf<List<String>>(emptyList()) }
     val openAIClient = remember { OpenAICompatibleClient() }
+    val geminiClient = remember { GeminiClient() }
 
     var triggerPrefix by remember { mutableStateOf(commandManager.getTriggerPrefix()) }
     var prefixError by remember { mutableStateOf<String?>(null) }
@@ -98,6 +105,70 @@ fun SettingsScreen(commandManager: CommandManager, prefs: SharedPreferences, key
     // servers get no header at all.
     LaunchedEffect(Unit) {
         apiKeys = withContext(Dispatchers.IO) { keyManager.getKeys() }
+    }
+
+    // Fetches one provider's live model list (issue #148). Groq rides the existing
+    // OpenAI-compatible prober against its fixed endpoint; Gemini gets a native
+    // listing call. Results land in [ProviderModelsCache] plus local state so the
+    // dropdown renders without refetching on every visit.
+    fun startModelFetch(type: String) {
+        val isGemini = type == ProviderType.GEMINI
+        if (!isGemini && type != ProviderType.GROQ) return
+        if (isGemini && isFetchingGeminiModels) return
+        if (!isGemini && isFetchingGroqModels) return
+
+        val key = apiKeys.firstOrNull() ?: return
+
+        if (isGemini) isFetchingGeminiModels = true else isFetchingGroqModels = true
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                if (isGemini) {
+                    geminiClient.fetchModels(key)
+                } else {
+                    openAIClient.fetchModels(key, GroqConfig.ENDPOINT).map { ids ->
+                        ids.filter { GroqModels.isChatCandidate(it) }
+                    }
+                }
+            }
+            val models = result.getOrNull().orEmpty()
+            val success = result.isSuccess && models.isNotEmpty()
+            val currentModels = if (isGemini) geminiModelList else groqModelList
+            val toCache = if (success) models else (ProviderModelsCache.get(type)?.models ?: currentModels)
+            ProviderModelsCache.put(type, ProviderModelsCache.Entry(toCache, attempted = true))
+            if (isGemini) {
+                isFetchingGeminiModels = false
+                if (success) {
+                    geminiModelList = models
+                    if (selectedModel.isBlank() && models.isNotEmpty()) {
+                        val pick = preferredModel(models, GeminiModels.DEFAULT)
+                        selectedModel = pick
+                        prefs.edit().putString(PrefKeys.GEMINI_MODEL, pick).apply()
+                    }
+                }
+            } else {
+                isFetchingGroqModels = false
+                if (success) {
+                    groqModelList = models
+                    if (groqModel.isBlank() && models.isNotEmpty()) {
+                        val pick = preferredModel(models, GroqModels.DEFAULT)
+                        groqModel = pick
+                        prefs.edit().putString(PrefKeys.GROQ_MODEL, pick).apply()
+                    }
+                }
+            }
+        }
+    }
+
+    // Auto-fetch once per session per provider (issue #148): fires when Settings shows
+    // a Gemini/Groq provider whose list has never been fetched this process — including
+    // the no-key case, so it runs automatically once a first key is added.
+    LaunchedEffect(providerType, apiKeys) {
+        if (providerType == ProviderType.GEMINI || providerType == ProviderType.GROQ) {
+            val cached = ProviderModelsCache.get(providerType)
+            if (apiKeys.isNotEmpty() && (cached == null || !cached.attempted)) {
+                startModelFetch(providerType)
+            }
+        }
     }
 
     var backupMessage by remember { mutableStateOf<String?>(null) }
@@ -174,11 +245,13 @@ fun SettingsScreen(commandManager: CommandManager, prefs: SharedPreferences, key
         }
     }
 
+    val rhythm = LocalSlateRhythm.current
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .graphicsLayer { }
-            .padding(horizontal = 20.dp, vertical = 16.dp)
+            .padding(horizontal = rhythm.screenPaddingH, vertical = rhythm.screenPaddingV)
     ) {
         ScreenTitle(stringResource(R.string.settings_title))
 
@@ -186,10 +259,10 @@ fun SettingsScreen(commandManager: CommandManager, prefs: SharedPreferences, key
         SlateCard {
             Text(
                 text = stringResource(R.string.settings_provider_title),
-                fontSize = 13.sp,
+                fontSize = rhythm.bodySize,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(rhythm.formGap))
             ExposedDropdownMenuBox(
                 expanded = providerExpanded,
                 onExpandedChange = { providerExpanded = !providerExpanded }
@@ -240,88 +313,70 @@ fun SettingsScreen(commandManager: CommandManager, prefs: SharedPreferences, key
                     )
                 }
             }
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(rhythm.formGap))
             if (providerType == ProviderType.GEMINI) {
                 Text(
                     text = stringResource(R.string.settings_model_title),
-                    fontSize = 13.sp,
+                    fontSize = rhythm.bodySize,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Spacer(modifier = Modifier.height(8.dp))
-                ExposedDropdownMenuBox(
+                Spacer(modifier = Modifier.height(rhythm.formGap))
+                DynamicModelDropdown(
+                    selectedModel = if (apiKeys.isEmpty() || selectedModel.isBlank()) "" else selectedModel,
+                    enabled = apiKeys.isNotEmpty(),
                     expanded = modelExpanded,
-                    onExpandedChange = { modelExpanded = !modelExpanded }
-                ) {
-                    SlateTextField(
-                        value = GeminiModels.label(selectedModel),
-                        onValueChange = {},
-                        readOnly = true,
-                        
-                        modifier = Modifier.menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
-                    )
-                    ExposedDropdownMenu(
-                        containerColor = MaterialTheme.colorScheme.surface,
-                        shape = RoundedCornerShape(10.dp),
-                        expanded = modelExpanded,
-                        onDismissRequest = { modelExpanded = false }
-                    ) {
-                        geminiModels.forEach { (id, label) ->
-                            DropdownMenuItem(
-                                text = { Text(label) },
-                                onClick = {
-                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    selectedModel = id
-                                    prefs.edit().putString(PrefKeys.GEMINI_MODEL, id).remove(PrefKeys.STRUCTURED_OUTPUT_DISABLED_AT).apply()
-                                    modelExpanded = false
-                                }
-                            )
+                    onExpandedChange = { isOpening ->
+                        modelExpanded = isOpening
+                        if (isOpening && apiKeys.isNotEmpty() && !isFetchingGeminiModels) {
+                            startModelFetch(ProviderType.GEMINI)
                         }
-                    }
-                }
+                    },
+                    models = geminiModelList,
+                    onSelect = { id ->
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        selectedModel = id
+                        prefs.edit().putString(PrefKeys.GEMINI_MODEL, id).remove(PrefKeys.STRUCTURED_OUTPUT_DISABLED_AT).apply()
+                        modelExpanded = false
+                    },
+                    onDismiss = { modelExpanded = false },
+                    isFetching = isFetchingGeminiModels,
+                    fetchingText = fetchingModelsMsg
+                )
             } else if (providerType == ProviderType.GROQ) {
                 Text(
                     text = stringResource(R.string.settings_model_title),
-                    fontSize = 13.sp,
+                    fontSize = rhythm.bodySize,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Spacer(modifier = Modifier.height(8.dp))
-                ExposedDropdownMenuBox(
+                Spacer(modifier = Modifier.height(rhythm.formGap))
+                DynamicModelDropdown(
+                    selectedModel = if (apiKeys.isEmpty() || groqModel.isBlank()) "" else groqModel,
+                    enabled = apiKeys.isNotEmpty(),
                     expanded = groqModelExpanded,
-                    onExpandedChange = { groqModelExpanded = !groqModelExpanded }
-                ) {
-                    SlateTextField(
-                        value = GroqModels.label(groqModel),
-                        onValueChange = {},
-                        readOnly = true,
-                        
-                        modifier = Modifier.menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
-                    )
-                    ExposedDropdownMenu(
-                        containerColor = MaterialTheme.colorScheme.surface,
-                        shape = RoundedCornerShape(10.dp),
-                        expanded = groqModelExpanded,
-                        onDismissRequest = { groqModelExpanded = false }
-                    ) {
-                        groqModels.forEach { (id, label) ->
-                            DropdownMenuItem(
-                                text = { Text(label) },
-                                onClick = {
-                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    groqModel = id
-                                    prefs.edit().putString(PrefKeys.GROQ_MODEL, id).remove(PrefKeys.STRUCTURED_OUTPUT_DISABLED_AT).apply()
-                                    groqModelExpanded = false
-                                }
-                            )
+                    onExpandedChange = { isOpening ->
+                        groqModelExpanded = isOpening
+                        if (isOpening && apiKeys.isNotEmpty() && !isFetchingGroqModels) {
+                            startModelFetch(ProviderType.GROQ)
                         }
-                    }
-                }
+                    },
+                    models = groqModelList,
+                    onSelect = { id ->
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        groqModel = id
+                        prefs.edit().putString(PrefKeys.GROQ_MODEL, id).remove(PrefKeys.STRUCTURED_OUTPUT_DISABLED_AT).apply()
+                        groqModelExpanded = false
+                    },
+                    onDismiss = { groqModelExpanded = false },
+                    isFetching = isFetchingGroqModels,
+                    fetchingText = fetchingModelsMsg
+                )
             } else {
                 Text(
                     text = stringResource(R.string.settings_endpoint_title),
-                    fontSize = 13.sp,
+                    fontSize = rhythm.bodySize,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Spacer(modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.height(rhythm.formGap))
                 SlateTextField(
                     value = customEndpoint,
                     onValueChange = {
@@ -352,17 +407,17 @@ fun SettingsScreen(commandManager: CommandManager, prefs: SharedPreferences, key
                     Text(
                         text = msg,
                         color = MaterialTheme.colorScheme.error,
-                        fontSize = 13.sp,
-                        modifier = Modifier.padding(top = 8.dp)
+                        fontSize = rhythm.bodySize,
+                        modifier = Modifier.padding(top = rhythm.formGap)
                     )
                 }
-                Spacer(modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.height(rhythm.formGap))
                 Text(
                     text = stringResource(R.string.settings_model_title),
-                    fontSize = 13.sp,
+                    fontSize = rhythm.bodySize,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Spacer(modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.height(rhythm.formGap))
                 if (customModels.isNotEmpty()) {
                     ExposedDropdownMenuBox(
                         expanded = customModelExpanded,
@@ -467,30 +522,30 @@ fun SettingsScreen(commandManager: CommandManager, prefs: SharedPreferences, key
                     Text(
                         text = msg,
                         color = if (fetchSuccess) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontSize = 13.sp,
-                        modifier = Modifier.padding(top = 4.dp)
+                        fontSize = rhythm.bodySize,
+                        modifier = Modifier.padding(top = rhythm.tightGap)
                     )
                 }
             }
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(rhythm.formGap))
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
                     text = stringResource(R.string.settings_temperature_title),
-                    fontSize = 13.sp,
+                    fontSize = rhythm.bodySize,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(modifier = Modifier.weight(1f))
                 Text(
                     text = String.format("%.1f", temperature),
-                    fontSize = 15.sp,
+                    fontSize = rhythm.emphasisSize,
                     fontWeight = FontWeight.Medium,
                     color = MaterialTheme.colorScheme.onSurface
                 )
             }
-            Spacer(modifier = Modifier.height(10.dp))
+            Spacer(modifier = Modifier.height(rhythm.sliderGap))
             Slider(
                 value = temperature,
                 onValueChange = {
@@ -505,17 +560,17 @@ fun SettingsScreen(commandManager: CommandManager, prefs: SharedPreferences, key
                 },
                 valueRange = 0f..2f,
                 steps = 19,
-                modifier = Modifier.fillMaxWidth().height(26.dp),
+                modifier = Modifier.fillMaxWidth().height(rhythm.sliderHeight),
                 colors = SliderDefaults.colors(
                     thumbColor = MaterialTheme.colorScheme.primary,
                     activeTrackColor = MaterialTheme.colorScheme.primary,
                     inactiveTrackColor = MaterialTheme.colorScheme.outline
                 )
             )
-            Spacer(modifier = Modifier.height(4.dp))
+            Spacer(modifier = Modifier.height(rhythm.tightGap))
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(rhythm.cardGap))
 
         // Card 2: Trigger Prefix
         SlateCard {
@@ -526,7 +581,7 @@ fun SettingsScreen(commandManager: CommandManager, prefs: SharedPreferences, key
             ) {
                 Text(
                     text = stringResource(R.string.settings_trigger_prefix_desc, triggerPrefix),
-                    fontSize = 13.sp,
+                    fontSize = rhythm.bodySize,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.weight(1f).padding(end = 16.dp)
                 )
@@ -554,22 +609,22 @@ fun SettingsScreen(commandManager: CommandManager, prefs: SharedPreferences, key
                 Text(
                     text = msg,
                     color = MaterialTheme.colorScheme.error,
-                    fontSize = 13.sp,
-                    modifier = Modifier.padding(top = 8.dp)
+                    fontSize = rhythm.bodySize,
+                    modifier = Modifier.padding(top = rhythm.formGap)
                 )
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(rhythm.cardGap))
 
         // Card 3: Backup
         SlateCard {
             Text(
                 text = stringResource(R.string.backup_desc),
-                fontSize = 13.sp,
+                fontSize = rhythm.bodySize,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(rhythm.groupGap))
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
@@ -601,48 +656,70 @@ fun SettingsScreen(commandManager: CommandManager, prefs: SharedPreferences, key
                 Text(
                     text = msg,
                     color = if (backupSuccess) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.error,
-                    fontSize = 13.sp,
-                    modifier = Modifier.padding(top = 8.dp)
+                    fontSize = rhythm.bodySize,
+                    modifier = Modifier.padding(top = rhythm.formGap)
                 )
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(rhythm.cardGap))
 
-        // Card 4: About
-        SlateCard(modifier = Modifier.weight(1f), fillHeight = true) {
-            Text(
-                text = stringResource(R.string.app_name) + " v" + BuildConfig.VERSION_NAME,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Medium,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                text = stringResource(R.string.settings_check_updates),
-                fontSize = 13.sp,
-                color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.clickable(interactionSource = null, indication = null) {
-                    uriHandler.openUri("https://github.com/Musheer360/SwiftSlate/releases/latest")
-                }
-            )
-            Spacer(modifier = Modifier.weight(1f))
+        // Card 4: About. The only weighted child, so its bottom edge lands flush
+        // screenPaddingV above the nav bar exactly like the last card on every
+        // other tab, and it absorbs whatever slack the rhythm above did not take.
+        //
+        // That slack is split rather than pooled. The two text groups each sit in
+        // an equally weighted half, so the divider lands on the card's midline and
+        // each group is centred within its own half. Pooling it instead — whether
+        // as weighted spacers hugging the divider (which opened a ~104 dp void on
+        // tall screens) or as one centred block (which left dead space above the
+        // version line and below the sponsor line) — is what this replaces.
+        SlateCard(
+            modifier = Modifier.weight(1f),
+            fillHeight = true
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text(
+                    text = stringResource(R.string.app_name) + " v" + BuildConfig.VERSION_NAME,
+                    fontSize = rhythm.emphasisSize,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Spacer(modifier = Modifier.height(rhythm.tightGap))
+                Text(
+                    text = stringResource(R.string.settings_check_updates),
+                    fontSize = rhythm.bodySize,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.clickable(interactionSource = null, indication = null) {
+                        uriHandler.openUri("https://github.com/Musheer360/SwiftSlate/releases/latest")
+                    }
+                )
+            }
+            Spacer(modifier = Modifier.height(rhythm.groupGap))
             SlateDivider()
-            Spacer(modifier = Modifier.weight(1f))
-            Text(
-                text = stringResource(R.string.settings_made_by),
-                fontSize = 13.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                text = stringResource(R.string.settings_sponsor),
-                fontSize = 13.sp,
-                color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.clickable(interactionSource = null, indication = null) {
-                    uriHandler.openUri("https://github.com/sponsors/Musheer360")
-                }
-            )
+            Spacer(modifier = Modifier.height(rhythm.groupGap))
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text(
+                    text = stringResource(R.string.settings_made_by),
+                    fontSize = rhythm.bodySize,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(rhythm.tightGap))
+                Text(
+                    text = stringResource(R.string.settings_sponsor),
+                    fontSize = rhythm.bodySize,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.clickable(interactionSource = null, indication = null) {
+                        uriHandler.openUri("https://github.com/sponsors/Musheer360")
+                    }
+                )
+            }
         }
     }
 
@@ -664,5 +741,108 @@ fun SettingsScreen(commandManager: CommandManager, prefs: SharedPreferences, key
                 }
             }
         )
+    }
+}
+
+/**
+ * First-run model choice from a freshly fetched provider catalogue.
+ *
+ * Returns [default] when the provider still serves it, else the first entry.
+ *
+ * Deliberately not just `models.first()`, which is what this used to be. Neither
+ * provider's /models response marks a recommended model and list order is not a
+ * recommendation: Gemini returns gemini-2.5-flash first, which is closed to new API
+ * keys and answers every request with NOT_FOUND ("no longer available to new users"),
+ * so a fresh install auto-selected a model that could not run a single command. Groq
+ * ordered qwen/qwen3.8-27b first, a reasoning model that is slower and needs its
+ * chain of thought stripped. The curated DEFAULT exists precisely to make this call;
+ * list order only decides when DEFAULT has been withdrawn.
+ */
+internal fun preferredModel(models: List<String>, default: String): String =
+    if (models.contains(default)) default else models.first()
+
+/**
+ * Read-only dropdown listing one provider's dynamically fetched model ids
+ * (issue #148). Opens immediately showing cached or live models, triggers
+ * real-time fetch when opened, and caps its height with vertical scroll
+ * so long provider catalogs stay usable.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun DynamicModelDropdown(
+    selectedModel: String,
+    enabled: Boolean,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    models: List<String>,
+    onSelect: (String) -> Unit,
+    onDismiss: () -> Unit,
+    isFetching: Boolean,
+    fetchingText: String
+) {
+    val rhythm = LocalSlateRhythm.current
+    ExposedDropdownMenuBox(
+        expanded = expanded && enabled,
+        onExpandedChange = { if (enabled) onExpandedChange(it) }
+    ) {
+        SlateTextField(
+            value = selectedModel,
+            onValueChange = {},
+            readOnly = true,
+            modifier = Modifier.menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
+        )
+        if (enabled && expanded) {
+            ExposedDropdownMenu(
+                containerColor = MaterialTheme.colorScheme.surface,
+                shape = RoundedCornerShape(10.dp),
+                expanded = expanded,
+                onDismissRequest = onDismiss,
+                // Provider catalogs can exceed a hundred entries — cap and scroll.
+                modifier = Modifier.heightIn(max = 300.dp)
+            ) {
+                if (isFetching) {
+                    DropdownMenuItem(
+                        text = {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                            ) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    strokeWidth = 2.dp,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Text(
+                                    text = fetchingText,
+                                    fontSize = rhythm.bodySize,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        },
+                        onClick = {},
+                        enabled = false
+                    )
+                    if (models.isNotEmpty()) {
+                        SlateDivider()
+                    }
+                }
+                models.forEach { id ->
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                text = id,
+                                color = if (id == selectedModel) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurface
+                                }
+                            )
+                        },
+                        onClick = { onSelect(id) }
+                    )
+                }
+            }
+        }
     }
 }

@@ -1,10 +1,20 @@
 package com.musheer360.swiftslate.model
 
 /**
- * Catalog of the Gemini models SwiftSlate offers and how each is tuned. Mirrors
- * [GroqModels]: each model is defined once in [SPECS] together with its thinking
- * level, and the dropdown list, default, validation, and per-model thinking
- * level all derive from that single table.
+ * Catalog of the Gemini models SwiftSlate curates and how each is tuned. Mirrors
+ * [GroqModels]: each curated model is defined once in [SPECS] together with its
+ * thinking level, and the default and per-model thinking level both derive from
+ * that single table. Since issue #148 the Settings dropdown no longer renders
+ * from this table — it lists whatever the provider's /models endpoint returns
+ * (see [ProviderModelsCache]); SPECS remains the source for defaults, retirement
+ * migration, and thinking levels.
+ *
+ * Model ids are shown to the user verbatim, exactly as the provider reports them.
+ * There is deliberately no id -> friendly-name mapping: a curated table can only
+ * ever name the handful of models it knows about, so the dropdown rendered pretty
+ * labels for two entries and raw ids for everything else the endpoint returned.
+ * Showing the provider's own ids is self-maintaining and matches the Custom
+ * provider, which has never had labels to map.
  *
  * Thinking control on Gemini 3.x is via generationConfig.thinkingConfig.thinkingLevel
  * (a string enum), kept per model here (spec-driven) rather than hardcoded in the
@@ -14,8 +24,8 @@ package com.musheer360.swiftslate.model
  */
 object GeminiModels {
 
-    /** One entry per offered model: its id, display label + the thinking level to request. */
-    private data class Spec(val id: String, val label: String, val thinkingLevel: String)
+    /** One entry per offered model: its id + the thinking level to request. */
+    private data class Spec(val id: String, val thinkingLevel: String)
 
     // Curated set, ordered cost-efficient -> higher quality.
     //
@@ -26,8 +36,8 @@ object GeminiModels {
     // and doubled latency on real 400s). Verify any new or edited entry against the live
     // API before shipping.
     private val SPECS: List<Spec> = listOf(
-        Spec("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite", "low"), // fastest/cheapest GA flash-lite; "low" = same latency as "minimal" on this model but slightly better reasoning
-        Spec("gemini-3.6-flash", "Gemini 3.6 Flash", "minimal")            // higher quality; minimal thinking to stay fast
+        Spec("gemini-3.5-flash-lite", "low"), // fastest/cheapest GA flash-lite; "low" = same latency as "minimal" on this model but slightly better reasoning
+        Spec("gemini-3.6-flash", "minimal")            // higher quality; minimal thinking to stay fast
     )
 
     /** Default model = first spec entry, so it can never point outside the catalog. */
@@ -36,18 +46,24 @@ object GeminiModels {
     /** Model IDs, in display order (used for validation and by the provider config). */
     val ALL: List<String> = SPECS.map { it.id }
 
-    /** (id, label) pairs for the Settings dropdown — shows a friendly name, stores the id. */
-    val OPTIONS: List<Pair<String, String>> = SPECS.map { it.id to it.label }
-
-    /** Friendly display label for [model]; falls back to the id if unknown. */
-    fun label(model: String): String = SPECS.firstOrNull { it.id == model }?.label ?: model
+    /**
+     * Ids that Google has withdrawn and must migrate to [DEFAULT] rather than pass
+     * through — requests with them fail for (at least) newer accounts, so keeping
+     * one selected would break every command (issue #113 precedent). Unknown ids
+     * that are NOT listed here belong to models fetched dynamically off the live
+     * /models endpoint (issue #148) and are kept verbatim.
+     */
+    private val RETIRED_IDS: Set<String> = setOf("gemini-2.5-flash-lite")
 
     /**
-     * Coerce a stored/selected model to a currently-supported one. This migrates
-     * users off retired ids (e.g. gemini-2.5-flash-lite, which is no longer
-     * available to new users) to [DEFAULT].
+     * Normalize a stored/selected model value. Dynamic selection (issue #148) means
+     * any id the API accepts may be stored, so unknown ids pass through trimmed;
+     * only blank values and known-retired ids coerce to [DEFAULT].
      */
-    fun sanitize(value: String?): String = if (value in ALL) value!! else DEFAULT
+    fun sanitize(value: String?): String {
+        val trimmed = value?.trim().orEmpty()
+        return if (trimmed.isEmpty() || trimmed in RETIRED_IDS) DEFAULT else trimmed
+    }
 
     /**
      * Thinking level to request for [model] via generationConfig.thinkingConfig,

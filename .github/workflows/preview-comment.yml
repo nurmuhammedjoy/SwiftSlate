@@ -1,0 +1,298 @@
+name: Comment Preview APK
+
+on:
+  workflow_run:
+    workflows: ["Build & Release"]
+    types: [completed]
+  # Manual test: allows a maintainer to trigger the comment for a past run.
+  # Kept after validation for future recovery (e.g. transient API failure).
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Workflow run ID to test (leave empty to use latest successful PR run)"
+        required: false
+        type: string
+
+concurrency:
+  group: preview-comment-${{ github.event.workflow_run.id || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  pull-requests: write
+
+jobs:
+  comment:
+    # workflow_run fires for push/master too (no PR). Only proceed when a PR is involved
+    # and the source workflow succeeded (preview APK only on success).
+    # workflow_dispatch always runs so manual tests work.
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event.workflow_run.event == 'pull_request' &&
+           github.event.workflow_run.conclusion == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve PR number and artifact
+        id: resolve
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            // Resolve workflow run (either the triggering run or a manual run_id)
+            let run;
+            let prNumber = null;
+
+            if (context.eventName === 'workflow_dispatch') {
+              const inputRunId = '${{ inputs.run_id }}';
+              if (inputRunId) {
+                const { data } = await github.request('GET /repos/{owner}/{repo}/actions/runs/{run_id}', {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: parseInt(inputRunId, 10),
+                });
+                run = data;
+                core.info(`Manual dispatch: using run ${run.id} (${run.head_branch} ${run.head_sha.slice(0,7)})`);
+              } else {
+                // No run_id supplied: pick latest successful Build & Release run that has a preview artifact
+                const { data } = await github.request('GET /repos/{owner}/{repo}/actions/runs', {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  per_page: 10,
+                  // status success handled after fetch
+                });
+                // This endpoint without workflow_id lists runs for all workflows; filter to Build & Release
+                // Instead, list for the workflow id 239854478 if available
+                core.info('No run_id supplied for manual dispatch — please supply one');
+                core.setFailed('run_id required for manual dispatch without auto-resolve yet');
+                return;
+              }
+            } else {
+              run = context.payload.workflow_run;
+              if (!run) {
+                core.setFailed('No workflow_run payload');
+                return;
+              }
+              core.info(`workflow_run ${run.id} event=${run.event} conclusion=${run.conclusion} sha=${run.head_sha.slice(0,7)} branch=${run.head_branch} repo=${run.head_repository.full_name}`);
+              // Ignore non-PR events (push to master) — they have no PR to comment on
+              if (run.event !== 'pull_request') {
+                core.info(`Skipping: event is ${run.event}, not pull_request`);
+                return;
+              }
+              if (run.conclusion !== 'success') {
+                core.info(`Skipping: conclusion is ${run.conclusion}`);
+                return;
+              }
+            }
+
+            // 1) Try direct pull_requests array (populated for same-repo PRs like #145)
+            if (run.pull_requests && run.pull_requests.length > 0) {
+              prNumber = run.pull_requests[0].number;
+              core.info(`Found PR via run.pull_requests: #${prNumber}`);
+            }
+
+            // 2) Try commits/{sha}/pulls — works for same-repo PRs where SHA exists in base repo
+            if (!prNumber) {
+              try {
+                const { data: prs } = await github.request('GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls', {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  commit_sha: run.head_sha,
+                });
+                if (prs && prs.length > 0) {
+                  // Prefer open PR
+                  const open = prs.find(p => p.state === 'open') || prs[0];
+                  prNumber = open.number;
+                  core.info(`Found PR via commits/${run.head_sha.slice(0,7)}/pulls: #${prNumber}`);
+                }
+              } catch (e) {
+                core.info(`commits/pulls lookup failed: ${e.message}`);
+              }
+            }
+
+            // 3) Try pulls?head=owner:branch — works for fork PRs (#144 guoxpeng:refactor/...)
+            if (!prNumber) {
+              try {
+                const headLabel = `${run.head_repository.owner.login}:${run.head_branch}`;
+                core.info(`Trying pulls?head=${headLabel}`);
+                const { data: prs } = await github.request('GET /repos/{owner}/{repo}/pulls', {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  head: headLabel,
+                  state: 'open',
+                });
+                if (prs && prs.length > 0) {
+                  prNumber = prs[0].number;
+                  core.info(`Found PR via pulls?head: #${prNumber}`);
+                } else {
+                  // Fallback: also check closed? For workflow_run after merge, PR may be closed
+                  const { data: prs2 } = await github.request('GET /repos/{owner}/{repo}/pulls', {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    head: headLabel,
+                    state: 'all',
+                    sort: 'updated',
+                    direction: 'desc',
+                  });
+                  if (prs2 && prs2.length > 0) {
+                    // Pick the one whose head.sha matches run.head_sha if possible
+                    const match = prs2.find(p => p.head.sha === run.head_sha) || prs2[0];
+                    prNumber = match.number;
+                    core.info(`Found PR via pulls?head (all): #${prNumber} state=${match.state}`);
+                    if (match.state !== 'open') {
+                      core.info(`PR #${prNumber} is not open — skipping comment (no point commenting on closed PR)`);
+                      // Still set output but later job will skip if not open; we check PR state again
+                      // For now, only comment on open PRs
+                      const { data: prDetails } = await github.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        pull_number: prNumber,
+                      });
+                      if (prDetails.state !== 'open') {
+                        core.info(`Skipping comment for closed PR #${prNumber}`);
+                        return;
+                      }
+                    }
+                  }
+                }
+              } catch (e) {
+                core.info(`pulls?head lookup failed: ${e.message}`);
+              }
+            }
+
+            if (!prNumber) {
+              core.info('Could not resolve PR number — skipping comment. This happens for push/master runs with no PR.');
+              return;
+            }
+
+            // 4) Fetch artifacts for the run
+            const { data: artData } = await github.request('GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts', {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: run.id,
+            });
+            const artifacts = artData.artifacts || [];
+            core.info(`Found ${artifacts.length} artifacts for run ${run.id}: ${artifacts.map(a=>a.name).join(', ')}`);
+            const preview = artifacts.find(a => a.name.startsWith('SwiftSlate-preview-pr'));
+            if (!preview) {
+              core.info('No SwiftSlate-preview-pr* artifact found — skipping. Lint/test-only runs or expired artifact.');
+              // Check if any artifact at all
+              if (artifacts.length === 0) {
+                core.info('No artifacts — workflow may not have produced preview APK (e.g. paths filter excluded it)');
+              }
+              return;
+            }
+
+            if (preview.expired) {
+              core.info(`Artifact ${preview.name} is expired — skipping comment`);
+              return;
+            }
+
+            const sizeMB = (preview.size_in_bytes / 1048576).toFixed(2);
+            const shortSha = run.head_sha.slice(0, 7);
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${run.id}`;
+            const artifactUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${run.id}/artifacts/${preview.id}`;
+
+            core.info(`Resolved PR #${prNumber}, artifact ${preview.name} (id ${preview.id}, ${sizeMB} MB), run ${runUrl}, artifactUrl ${artifactUrl}`);
+
+            core.setOutput('pr', String(prNumber));
+            core.setOutput('run_id', String(run.id));
+            core.setOutput('artifact', preview.name);
+            core.setOutput('artifact_id', String(preview.id));
+            core.setOutput('size_mb', sizeMB);
+            core.setOutput('size_bytes', String(preview.size_in_bytes));
+            core.setOutput('short_sha', shortSha);
+            core.setOutput('run_url', runUrl);
+            core.setOutput('artifact_url', artifactUrl);
+            core.setOutput('head_sha', run.head_sha);
+
+      - name: Create or update comment (idempotent)
+        if: steps.resolve.outputs.pr != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const pr = parseInt('${{ steps.resolve.outputs.pr }}', 10);
+            const runId = '${{ steps.resolve.outputs.run_id }}';
+            const artifact = '${{ steps.resolve.outputs.artifact }}';
+            const artifactId = '${{ steps.resolve.outputs.artifact_id }}';
+            const sizeMB = '${{ steps.resolve.outputs.size_mb }}';
+            const sizeBytes = '${{ steps.resolve.outputs.size_bytes }}';
+            const shortSha = '${{ steps.resolve.outputs.short_sha }}';
+            const headSha = '${{ steps.resolve.outputs.head_sha }}';
+            const runUrl = '${{ steps.resolve.outputs.run_url }}';
+            const artifactUrl = '${{ steps.resolve.outputs.artifact_url }}';
+
+            const body = `### 📦 Preview APK — PR #${pr} · \`${shortSha}\` · \`${sizeMB} MB\`
+
+            [Direct download](${artifactUrl}) · [Run](${runUrl}) · \`${artifact}.zip\` → single \`.apk\`, no folders · expires 14d
+
+            Unzip → installs as **SwiftSlate Preview** (\`com.musheer360.swiftslate.preview\`), separate from stable. Enable in Settings → Accessibility.
+
+            <!-- preview-apk pr=${pr} run=${runId} sha=${headSha} -->`;
+
+            // Find existing bot comment (handles pagination, avoids duplicate on re-run)
+            // GitHub's comment API is eventually consistent — a just-created comment may not
+            // appear for a few seconds, which caused duplicate creation when two workflow_runs
+            // fired close together (PR144). Retry up to 3 times with backoff.
+            const marker = '<!-- preview-apk';
+            let existing = null;
+            let comments = [];
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              comments = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr,
+                per_page: 100,
+              });
+              core.info(`Attempt ${attempt}: found ${comments.length} total comments on PR #${pr}`);
+              for (const c of comments) {
+                if (c.user && c.user.login === 'github-actions[bot]' && c.body && c.body.includes(marker)) {
+                  existing = c;
+                  break;
+                }
+              }
+              if (existing) {
+                core.info(`Found existing preview comment ${existing.id} on attempt ${attempt}`);
+                break;
+              }
+              if (attempt < 3) {
+                core.info(`No existing preview comment found yet (attempt ${attempt}), waiting 5s before retry...`);
+                await new Promise(r => setTimeout(r, 5000));
+              }
+            }
+            // If duplicates exist (legacy peter-evans runs or race), clean them: keep the first, delete the rest
+            const dups = comments.filter(c => c.user && c.user.login === 'github-actions[bot]' && c.body && c.body.includes(marker));
+            if (dups.length > 1) {
+              core.info(`Found ${dups.length} duplicate preview comments — cleaning up, keeping ${dups[0].id}`);
+              for (let i = 1; i < dups.length; i++) {
+                try {
+                  await github.rest.issues.deleteComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    comment_id: dups[i].id,
+                  });
+                  core.info(`Deleted duplicate comment ${dups[i].id}`);
+                } catch (e) {
+                  core.warning(`Failed to delete duplicate ${dups[i].id}: ${e.message}`);
+                }
+              }
+              // Reuse the first one as existing
+              existing = dups[0];
+            }
+
+            if (existing) {
+              core.info(`Updating existing comment ${existing.id} on PR #${pr}`);
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              core.info(`Creating new comment on PR #${pr}`);
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr,
+                body,
+              });
+            }
