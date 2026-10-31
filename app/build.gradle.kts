@@ -50,16 +50,31 @@ android {
     }
 
     signingConfigs {
-        val ksFile = System.getenv("KEYSTORE_FILE")
-        val ksPassword = System.getenv("KEYSTORE_PASSWORD")
-        val ksAlias = System.getenv("KEY_ALIAS")
-        val ksKeyPassword = System.getenv("KEY_PASSWORD")
-        if (ksFile != null && ksPassword != null && ksAlias != null && ksKeyPassword != null) {
+        // Empty must count as absent, not just null: CI exports every one of these variables
+        // even when the matching secret is not configured, so the old `!= null` checks built a
+        // signing config with a blank alias and passwords. The failure then surfaced minutes
+        // later inside packageRelease as "Tag number over 30 is not supported" — a message
+        // that says nothing about the actual problem. `isNullOrBlank` keeps the unsigned-only
+        // case working (local `assembleRelease`, lint, tests) while rejecting a half-set one.
+        val signingValues = linkedMapOf(
+            "KEYSTORE_FILE" to System.getenv("KEYSTORE_FILE"),
+            "KEYSTORE_PASSWORD" to System.getenv("KEYSTORE_PASSWORD"),
+            "KEY_ALIAS" to System.getenv("KEY_ALIAS"),
+            "KEY_PASSWORD" to System.getenv("KEY_PASSWORD"),
+        )
+        val missing = signingValues.filterValues { it.isNullOrBlank() }.keys
+        if (missing.isNotEmpty() && missing.size < signingValues.size) {
+            throw GradleException(
+                "Release signing is only partially configured. Missing: ${missing.joinToString(", ")}. " +
+                    "Set all four variables or none — with none set the release build is left unsigned.",
+            )
+        }
+        if (missing.isEmpty()) {
             create("release") {
-                storeFile = file(ksFile)
-                storePassword = ksPassword
-                keyAlias = ksAlias
-                keyPassword = ksKeyPassword
+                storeFile = file(signingValues.getValue("KEYSTORE_FILE").orEmpty())
+                storePassword = signingValues.getValue("KEYSTORE_PASSWORD").orEmpty()
+                keyAlias = signingValues.getValue("KEY_ALIAS").orEmpty()
+                keyPassword = signingValues.getValue("KEY_PASSWORD").orEmpty()
             }
         }
     }
