@@ -1,0 +1,8 @@
+- ci(release): fail fast on missing signing secrets; reuse orphan tags
+- ci(release): stop silent failure in changelog and notify jobs
+- Handle potential errors in PATCH variable assignment
+- fix(settings): use the curated default for first-run model selection
+- fix(models): exclude Orpheus TTS models from the Groq model list
+- fix(models): keep per-model thinking pins, strip leaked reasoning
+- refactor(models): drop the curated id -> display-name mapping
+- fix(keys): only re
