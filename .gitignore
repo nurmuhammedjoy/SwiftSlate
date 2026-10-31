@@ -25,3 +25,6 @@ local.properties
 app/build
 app/release
 release.keystore
+
+# Locally built APKs + signing key from scripts/build-apk-codespace.sh
+/build-out/
